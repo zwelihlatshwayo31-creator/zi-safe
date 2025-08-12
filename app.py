@@ -26,6 +26,21 @@ import streamlit as st
 # -----------------------
 # Config & Utilities
 # -----------------------
+import os
+import streamlit as st
+from dotenv import load_dotenv
+
+load_dotenv()
+
+# ↓ Helper so it works both locally (.env) and on Streamlit Cloud (st.secrets)
+def get_secret(name: str, default: str = ""):
+    try:
+        return st.secrets.get(name, os.getenv(name, default))
+    except Exception:
+        return os.getenv(name, default)
+
+SERPAPI_KEY = get_secret("SERPAPI_KEY", "")
+
 load_dotenv()
 CACHE_DIR = os.path.join(os.path.dirname(__file__), "sds_cache")
 os.makedirs(CACHE_DIR, exist_ok=True)
@@ -35,7 +50,6 @@ DEFAULT_SUPPLIERS = [
     "acros.com", "strem.com", "merckmillipore.com"
 ]
 
-SERPAPI_KEY = os.getenv("SERPAPI_KEY", "")
 USER_AGENT = "SDS-Summarizer/1.4 (+local)"
 TIMEOUT = 25
 HEADERS = {"User-Agent": USER_AGENT}
