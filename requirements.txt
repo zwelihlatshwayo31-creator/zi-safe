@@ -1,0 +1,8 @@
+streamlit>=1.33
+requests>=2.31
+pdfminer.six>=20231228
+beautifulsoup4>=4.12
+lxml>=4.9
+python-dotenv>=1.0
+pydantic>=2.5
+rapidfuzz>=3.6
