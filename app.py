@@ -16,7 +16,7 @@ from urllib.parse import urlparse, unquote
 import requests
 import streamlit as st
 from dotenv import load_dotenv
-from pdfminer.high_level import extract_text
+from pdfminer.high_level import extract_text  # correct import for pdfminer.six
 from pydantic import BaseModel, Field
 from rapidfuzz import fuzz
 
@@ -194,6 +194,67 @@ def detect_chemicals(text: str) -> List[str]:
                 continue
             found.add(name_norm)
     return sorted({cap_title(n) for n in found})[:25]
+
+# ---------- NEW: robust, line-scoped chemical list parsing ----------
+LABELS = {"reactants": r"Reactants?", "products": r"Products?", "solvents": r"Solvents?"}
+
+def _extract_list_after_label(text: str, label_regex: str) -> str:
+    """Return ONLY the text on the SAME LINE as the label (avoid grabbing the whole procedure)."""
+    if not text:
+        return ""
+    m = re.search(fr"(?im)^\s*{label_regex}\s*[:\-]\s*(.+)$", text)
+    return (m.group(1).strip() if m else "")
+
+def _clean_semicolon_list(s: str) -> str:
+    """Normalize to semicolon-separated, dedupe, trim; drop obvious non-chem tokens/units."""
+    if not s:
+        return ""
+    items_raw = re.split(r"[;,\n]+", s)
+    cleaned: List[str] = []
+    seen = set()
+    drop_patterns = [
+        r"\b(stir|heat|cool|add|filter|wash|dry|evaporate|reflux|quench|mix|transfer|record|allow)\b",
+        r"\b(mL|ml|L|g|mg|µL|°C|deg|hours?|hrs?|mins?|seconds?)\b",
+        r"^\d+(\.\d+)?$",
+        r"^\d+(\.\d+)?\s*(mL|ml|L|g|mg)$",
+    ]
+    drop_re = re.compile("|".join(drop_patterns), re.IGNORECASE)
+
+    for it in items_raw:
+        t = it.strip()
+        if not t:
+            continue
+        if drop_re.search(t):
+            continue
+        if len(t) < 2:
+            continue
+        key = t.lower()
+        if key not in seen:
+            seen.add(key)
+            cleaned.append(t)
+
+    cleaned = cleaned[:30]
+    return "; ".join(cleaned)
+
+def fallback_guess_chems(text: str, max_items=12) -> str:
+    # Conservative fallback using detector
+    candidates = detect_chemicals(text or "")
+    return "; ".join(candidates[:max_items])
+
+def parse_chem_lists(source_text: str) -> Tuple[str, str, str]:
+    rx = _extract_list_after_label(source_text, LABELS["reactants"])
+    px = _extract_list_after_label(source_text, LABELS["products"])
+    sx = _extract_list_after_label(source_text, LABELS["solvents"])
+    rx = _clean_semicolon_list(rx) or ""
+    px = _clean_semicolon_list(px) or ""
+    sx = _clean_semicolon_list(sx) or ""
+    if not (rx or px or sx):
+        guess = fallback_guess_chems(source_text)
+        rx = guess  # put guesses into Reactants by default; user can split
+    return rx, px, sx
+
+def _hash_text(t: str) -> str:
+    return hashlib.sha256((t or "").encode("utf-8")).hexdigest()
 
 # ---------- Search & PDF ----------
 def search_sds_serpapi(chemical: str, suppliers: List[str], num: int = 12):
@@ -653,7 +714,7 @@ state = AppState()
 col1, col2 = st.columns([2, 1])
 with col1:
     proc_text = st.text_area("Paste your procedure (free text)", height=220,
-                             placeholder="e.g., Warm, then add acetic anhydride; cool, filter, and dry...")
+                             placeholder="e.g., Reactants: acetone; benzaldehyde; NaOH\nSolvents: ethanol; water\nProducts: benzyl alcohol; sodium benzoate\nThen warm, add acetic anhydride; cool, filter...")
 with col2:
     supplier_str = st.text_input("Restrict search to suppliers (comma‑separated domains)",
                                  ", ".join(DEFAULT_SUPPLIERS))
@@ -670,12 +731,51 @@ with st.sidebar:
     state.compliance_enabled = st.toggle("Enable compliance alerts", value=True)
     state.jurisdiction = st.selectbox("Jurisdiction", ["US (Federal)", "California (Prop 65)", "EU (REACH/CLP)", "South Africa (HCA/GHS)"], index=0)
 
-detected = detect_chemicals(proc_text) if proc_text.strip() else []
+# ---------- NEW: line‑scoped, non‑overwriting chemicals UI ----------
 st.subheader("Chemicals (edit as needed)")
-chem_input = st.text_input("Reactants, products, solvents (semicolon‑separated)",
-                           value="; ".join(detected),
-                           help="Use semicolons (;) between names so commas inside names are preserved.")
-chemical_list = [c.strip() for c in chem_input.split(";") if c.strip()]
+
+# Update defaults only when the procedure text changes
+current_hash = _hash_text(proc_text)
+if st.session_state.get("autofill_source_hash") != current_hash:
+    r_default, p_default, s_default = parse_chem_lists(proc_text)
+    st.session_state["reactants_field"] = r_default
+    st.session_state["products_field"]  = p_default
+    st.session_state["solvents_field"]  = s_default
+    st.session_state["autofill_source_hash"] = current_hash
+
+# Three separate fields, semicolon‑normalized
+reactants = st.text_area(
+    "Reactants (semicolon‑separated)",
+    key="reactants_field",
+    placeholder="e.g., acetone; benzaldehyde; sodium hydroxide",
+    height=80,
+    help="Use semicolons (;) so commas inside names are preserved."
+)
+products = st.text_area(
+    "Products (semicolon‑separated)",
+    key="products_field",
+    placeholder="e.g., benzyl alcohol; sodium benzoate",
+    height=80
+)
+solvents = st.text_area(
+    "Solvents (semicolon‑separated)",
+    key="solvents_field",
+    placeholder="e.g., ethanol; water; toluene",
+    height=80
+)
+
+# Build the combined chemical list (dedup, keep order)
+def _split_semis(s: str) -> List[str]:
+    return [c.strip() for c in (s or "").split(";") if c.strip()]
+
+combined = _split_semis(reactants) + _split_semis(products) + _split_semis(solvents)
+seen = set()
+chemical_list: List[str] = []
+for c in combined:
+    key = c.lower()
+    if key not in seen:
+        seen.add(key)
+        chemical_list.append(c)
 
 # --- Diagnostics & manual SDS input ---
 with st.expander("Debug & Manual SDS input", expanded=False):
@@ -782,4 +882,4 @@ if results_docs:
         st.write(f"**{d.chemical}** – {d.supplier}")
         st.code(d.url)
 else:
-    st.info("Enter your procedure and semicolon‑separated chemicals, then click ‘Fetch SDS & Summarize’.")
+    st.info("Enter your procedure and fill the Reactants/Products/Solvents (semicolon‑separated), then click ‘Fetch SDS & Summarize’.")
