@@ -1,6 +1,5 @@
 """
-Zi Safe — SDS Safety Summarizer (Streamlit + SerpAPI + PubChem)
-Includes: Compliance Alerts + Debug panel + Manual SDS URL input
+Zi Safe — SDS Safety Summarizer (Streamlit + SerpAPI + PubChem + AI auto-format)
 """
 
 import os
@@ -19,6 +18,7 @@ from dotenv import load_dotenv
 from pdfminer.high_level import extract_text  # correct import for pdfminer.six
 from pydantic import BaseModel, Field
 from rapidfuzz import fuzz
+import httpx
 
 # ---------- Setup ----------
 load_dotenv()
@@ -42,31 +42,75 @@ DEFAULT_SUPPLIERS = [
     "acros.com", "strem.com", "merckmillipore.com",
 ]
 
-USER_AGENT = "ZiSafe/1.8"
+USER_AGENT = "ZiSafe/1.9"
 TIMEOUT = 25
 HEADERS = {"User-Agent": USER_AGENT}
 
-SECTION_HINTS = [
-    ("hazard", ["Hazard(s) identification", "Hazard identification", "GHS", "Hazard statements", "H\\d{3}", "P\\d{3}"]),
-    ("first_aid", ["First aid measures", "First-aid measures", "First Aid"]),
-    ("fire_fighting", ["Fire-fighting measures", "Fire fighting measures", "Fire Fighting"]),
-    ("accidental_release", ["Accidental release measures", "Spill", "Leak"]),
-    ("handling_storage", ["Handling and storage", "Handling", "Storage"]),
-    ("exposure_ppe", ["Exposure controls", "Exposure Controls/Personal Protection", "Personal protection", "PPE", "Control parameters"]),
-    ("stability_reactivity", ["Stability and reactivity", "Reactivity", "Incompatibilities", "Conditions to avoid"]),
-    ("toxicology", ["Toxicological information", "Toxicology"]),
-]
-
-OPERATION_CUES = {
-    "heating": ["heat", "heating", "reflux", "boil", "distill", "evaporate", "dry under vacuum"],
-    "acid_base": ["add acid", "add base", "neutralize", "acidify", "basify", "pH"],
-    "oxidizer": ["add*peroxide", "KMnO4", "chromium(VI)", "bleach", "nitric acid"],
-    "reducing": ["NaBH4", "LiAlH4", "hydride", "hydrogenation"],
-    "pressurized": ["pressure", "autoclave", "sealed tube"],
-    "exotherm": ["exotherm", "vigorous", "add slowly", "cooling bath", "ice bath"],
-    "volatile": ["diethyl ether", "hexane", "acetone", "dichloromethane", "chloroform", "acetonitrile"],
-    "cryogenic": ["dry ice", "liquid nitrogen"],
+# ---------- AI Auto-format (OpenAI-compatible via OpenRouter or OpenAI) ----------
+AI_SYSTEM_PROMPT = """You are a chemistry-aware editor that normalizes experimental procedures.
+Return STRICT JSON that follows this schema:
+{
+  "reactants": "semicolon-separated list (no trailing semicolon)",
+  "products": "semicolon-separated list",
+  "solvents": "semicolon-separated list",
+  "normalized_procedure": "the cleaned procedure body with the three label lines removed"
 }
+Rules:
+- Only include chemical names in those three lists (no quantities, units, temperatures, or verbs).
+- Keep names as written by the user if they look correct; otherwise fix obvious typos.
+- Parentheses and commas inside names are allowed; separate ITEMS with semicolons.
+- If a list is unknown, return an empty string "" (not null).
+- DO NOT add commentary. Output ONLY the JSON object.
+"""
+
+def _get_llm_client():
+    api_key = get_secret("LLM_API_KEY", "")
+    base_url = get_secret("LLM_BASE_URL", "") or "https://openrouter.ai/api/v1"
+    model = get_secret("LLM_MODEL", "gpt-4o-mini")
+    if not api_key:
+        return None, None, None
+    headers = {"Authorization": f"Bearer {api_key}", "Content-Type": "application/json"}
+    return base_url, model, headers
+
+def ai_autofix_procedure(raw_text: str) -> Optional[dict]:
+    base_url, model, headers = _get_llm_client()
+    if not base_url:
+        st.error("LLM not configured. Add LLM_API_KEY (and optionally LLM_BASE_URL, LLM_MODEL) to secrets.")
+        return None
+
+    messages = [
+        {"role": "system", "content": AI_SYSTEM_PROMPT},
+        {"role": "user", "content": raw_text or ""},
+    ]
+    payload = {
+        "model": model,
+        "messages": messages,
+        "temperature": 0.1,
+        "response_format": {"type": "json_object"},  # supported by OpenRouter & OpenAI
+    }
+
+    try:
+        with httpx.Client(timeout=45.0) as client:
+            resp = client.post(f"{base_url}/chat/completions", headers=headers, json=payload)
+        resp.raise_for_status()
+        data = resp.json()
+        content = data["choices"][0]["message"]["content"]
+        obj = json.loads(content)
+
+        def _norm(s):
+            if not isinstance(s, str): return ""
+            parts = [p.strip() for p in re.split(r"[;\n]+", s) if p.strip()]
+            return "; ".join(parts[:30])
+
+        return {
+            "reactants": _norm(obj.get("reactants", "")),
+            "products": _norm(obj.get("products", "")),
+            "solvents": _norm(obj.get("solvents", "")),
+            "normalized_procedure": obj.get("normalized_procedure", "").strip(),
+        }
+    except Exception as e:
+        st.error(f"AI formatting failed: {e}")
+        return None
 
 # ---------- Models ----------
 @dataclass
@@ -94,6 +138,30 @@ class AppState(BaseModel):
     delay_s: float = Field(default=0.3)
     jurisdiction: str = Field(default="US (Federal)")
     compliance_enabled: bool = Field(default=True)
+
+# ---------- Section detection ----------
+SECTION_HINTS = [
+    ("hazard", ["Hazard(s) identification", "Hazard identification", "GHS", "Hazard statements", "H\\d{3}", "P\\d{3}"]),
+    ("first_aid", ["First aid measures", "First-aid measures", "First Aid"]),
+    ("fire_fighting", ["Fire-fighting measures", "Fire fighting measures", "Fire Fighting"]),
+    ("accidental_release", ["Accidental release measures", "Spill", "Leak"]),
+    ("handling_storage", ["Handling and storage", "Handling", "Storage"]),
+    ("exposure_ppe", ["Exposure controls", "Exposure Controls/Personal Protection", "Personal protection", "PPE", "Control parameters"]),
+    ("stability_reactivity", ["Stability and reactivity", "Reactivity", "Incompatibilities", "Conditions to avoid"]),
+    ("toxicology", ["Toxicological information", "Toxicology"]),
+]
+
+# ---------- Operation cues for procedure-aware tips ----------
+OPERATION_CUES = {
+    "heating": ["heat", "heating", "reflux", "boil", "distill", "evaporate", "dry under vacuum"],
+    "acid_base": ["add acid", "add base", "neutralize", "acidify", "basify", "pH"],
+    "oxidizer": ["add*peroxide", "KMnO4", "chromium(VI)", "bleach", "nitric acid"],
+    "reducing": ["NaBH4", "LiAlH4", "hydride", "hydrogenation"],
+    "pressurized": ["pressure", "autoclave", "sealed tube"],
+    "exotherm": ["exotherm", "vigorous", "add slowly", "cooling bath", "ice bath"],
+    "volatile": ["diethyl ether", "hexane", "acetone", "dichloromethane", "chloroform", "acetonitrile"],
+    "cryogenic": ["dry ice", "liquid nitrogen"],
+}
 
 # ---------- Helpers ----------
 def guess_supplier_from_url(url: str, custom_map: Optional[Dict[str, str]] = None) -> Optional[str]:
@@ -195,18 +263,16 @@ def detect_chemicals(text: str) -> List[str]:
             found.add(name_norm)
     return sorted({cap_title(n) for n in found})[:25]
 
-# ---------- NEW: robust, line-scoped chemical list parsing ----------
+# ---------- Chemical list parsing (line-scoped) ----------
 LABELS = {"reactants": r"Reactants?", "products": r"Products?", "solvents": r"Solvents?"}
 
 def _extract_list_after_label(text: str, label_regex: str) -> str:
-    """Return ONLY the text on the SAME LINE as the label (avoid grabbing the whole procedure)."""
     if not text:
         return ""
     m = re.search(fr"(?im)^\s*{label_regex}\s*[:\-]\s*(.+)$", text)
     return (m.group(1).strip() if m else "")
 
 def _clean_semicolon_list(s: str) -> str:
-    """Normalize to semicolon-separated, dedupe, trim; drop obvious non-chem tokens/units."""
     if not s:
         return ""
     items_raw = re.split(r"[;,\n]+", s)
@@ -219,25 +285,17 @@ def _clean_semicolon_list(s: str) -> str:
         r"^\d+(\.\d+)?\s*(mL|ml|L|g|mg)$",
     ]
     drop_re = re.compile("|".join(drop_patterns), re.IGNORECASE)
-
     for it in items_raw:
         t = it.strip()
-        if not t:
-            continue
-        if drop_re.search(t):
-            continue
-        if len(t) < 2:
+        if not t or drop_re.search(t) or len(t) < 2:
             continue
         key = t.lower()
         if key not in seen:
             seen.add(key)
             cleaned.append(t)
-
-    cleaned = cleaned[:30]
-    return "; ".join(cleaned)
+    return "; ".join(cleaned[:30])
 
 def fallback_guess_chems(text: str, max_items=12) -> str:
-    # Conservative fallback using detector
     candidates = detect_chemicals(text or "")
     return "; ".join(candidates[:max_items])
 
@@ -250,13 +308,13 @@ def parse_chem_lists(source_text: str) -> Tuple[str, str, str]:
     sx = _clean_semicolon_list(sx) or ""
     if not (rx or px or sx):
         guess = fallback_guess_chems(source_text)
-        rx = guess  # put guesses into Reactants by default; user can split
+        rx = guess
     return rx, px, sx
 
 def _hash_text(t: str) -> str:
     return hashlib.sha256((t or "").encode("utf-8")).hexdigest()
 
-# ---------- Search & PDF ----------
+# ---------- SDS Search & PDF ----------
 def search_sds_serpapi(chemical: str, suppliers: List[str], num: int = 12):
     if not SERPAPI_KEY:
         return []
@@ -265,9 +323,7 @@ def search_sds_serpapi(chemical: str, suppliers: List[str], num: int = 12):
         r = requests.get(
             "https://serpapi.com/search.json",
             params={"engine": "google", "q": q, "num": num, "api_key": SERPAPI_KEY},
-            headers=HEADERS,
-            timeout=TIMEOUT,
-        )
+            headers=HEADERS, timeout=TIMEOUT)
         r.raise_for_status()
         data = r.json()
         results = []
@@ -297,10 +353,8 @@ def download_pdf(url: str) -> Optional[str]:
         return str(fpath)
     except Exception:
         if fpath.exists():
-            try:
-                fpath.unlink()
-            except Exception:
-                pass
+            try: fpath.unlink()
+            except Exception: pass
         return None
 
 def extract_pdf_text(fpath: str) -> str:
@@ -309,88 +363,14 @@ def extract_pdf_text(fpath: str) -> str:
     except Exception:
         return ""
 
-# ---------- PubChem ----------
-PUBCHEM_BASE = "https://pubchem.ncbi.nlm.nih.gov/rest"
-
-def pubchem_name_to_cid(name: str) -> Optional[int]:
-    try:
-        r = requests.get(
-            f"{PUBCHEM_BASE}/pug/compound/name/{requests.utils.quote(name)}/cids/JSON",
-            headers=HEADERS,
-            timeout=TIMEOUT,
-        )
-        if r.status_code != 200:
-            return None
-        cids = r.json().get("IdentifierList", {}).get("CID", [])
-        return cids[0] if cids else None
-    except Exception:
-        return None
-
-class PubChemInfoError(Exception):
-    pass
-
-def pubchem_cid_summary(cid: int):
-    info = PubChemInfo(name_input=str(cid), cid=cid)
-    try:
-        r = requests.get(f"{PUBCHEM_BASE}/pug_view/data/compound/{cid}/JSON/", headers=HEADERS, timeout=TIMEOUT)
-        if r.status_code != 200:
-            return info
-        record = r.json().get("Record", {})
-        sections = record.get("Section", [])
-
-        def find_sec(lst, name):
-            for s in lst:
-                if s.get("TOCHeading") == name:
-                    return s
-            return None
-
-        comp_id = find_sec(sections, "Names and Identifiers")
-        if comp_id:
-            for s in comp_id.get("Section", []):
-                if s.get("TOCHeading") == "IUPAC Name":
-                    for it in s.get("Information", []):
-                        info.iupac_name = it.get("Value", {}).get("StringWithMarkup", [{}])[0].get("String")
-                if s.get("TOCHeading") == "Synonyms":
-                    for it in s.get("Information", []):
-                        for v in it.get("Value", {}).get("StringWithMarkup", []):
-                            sv = v.get("String")
-                            if sv:
-                                info.synonyms.append(sv)
-                if s.get("TOCHeading") == "Record Title":
-                    for it in s.get("Information", []):
-                        info.canonical_name = it.get("Value", {}).get("StringWithMarkup", [{}])[0].get("String")
-        safety = find_sec(sections, "Safety and Hazards")
-        if safety:
-            for s in safety.get("Section", []):
-                if s.get("TOCHeading") == "GHS Classification":
-                    for it in s.get("Information", []):
-                        for tb in it.get("Value", {}).get("StringWithMarkup", []):
-                            for code in re.findall(r"\bH\d{3}\b", tb.get("String", "")):
-                                if code not in info.ghs_hcodes:
-                                    info.ghs_hcodes.append(code)
-    except Exception:
-        pass
-    info.synonyms = sorted(set(info.synonyms))[:50]
-    return info
-
-def normalize_via_pubchem(names: List[str]) -> Dict[str, PubChemInfo]:
-    out: Dict[str, PubChemInfo] = {}
-    for n in names:
-        cid = pubchem_name_to_cid(n)
-        out[n] = pubchem_cid_summary(cid) if cid else PubChemInfo(name_input=n)
-        out[n].name_input = n
-    return out
-
-# ---------- SDS parsing & consolidation ----------
+# ---------- SDS parsing & summary ----------
 def split_sections(text: str) -> Dict[str, str]:
     sections: Dict[str, str] = {}
     t = re.sub(r"\r", "", text)
     pattern = re.compile(r"(?im)^\s*(section\s*(\d{1,2})\s*[:\-–]\s*)(.+?)$")
     indices: List[Tuple[int, int, str]] = []
     for m in pattern.finditer(t):
-        start = m.start()
-        secno = int(m.group(2))
-        title = m.group(3).strip()
+        start = m.start(); secno = int(m.group(2)); title = m.group(3).strip()
         indices.append((start, secno, title))
     ends = [i[0] for i in indices] + [len(t)]
     chunks: Dict[str, str] = {}
@@ -399,14 +379,12 @@ def split_sections(text: str) -> Dict[str, str]:
         chunks[f"section_{secno}"] = t[start:end].strip()
 
     for key, hints in SECTION_HINTS:
-        best = None
-        best_score = -1
+        best = None; best_score = -1
         for sname, chunk in chunks.items():
             head = chunk.split("\n", 1)[0]
             score = max([fuzz.partial_ratio(head.lower(), h.lower()) for h in hints] + [0])
             if score > best_score:
-                best_score = score
-                best = sname
+                best_score = score; best = sname
         if best:
             sections[key] = chunks[best]
 
@@ -415,8 +393,7 @@ def split_sections(text: str) -> Dict[str, str]:
             for h in hints:
                 m = re.search(rf"(?is){re.escape(h)}(.{{0,2500}})", t)
                 if m:
-                    sections[key] = m.group(0)
-                    break
+                    sections[key] = m.group(0); break
     return sections
 
 HAZARD_CODE_RE = re.compile(r"\b(H\d{3}|P\d{3})\b")
@@ -452,12 +429,10 @@ def extract_key_points(sections: Dict[str, str]) -> Dict[str, List[str]]:
 def procedure_risk_hints(proc: str) -> List[str]:
     tips: List[str] = []
     low = proc.lower()
-
     def has(pat: str) -> bool:
         if "*" in pat:
             return re.search(pat.replace("*", ".*"), low) is not None
         return pat in low
-
     if any(has(c) for c in OPERATION_CUES["heating"]):
         tips.append("Heating/reflux: check flash points; use condenser; avoid flames; heat‑resistant gloves.")
     if any(has(c) for c in OPERATION_CUES["acid_base"]):
@@ -521,32 +496,18 @@ def consolidate_summary(docs: List[SDSDoc], proc_text: str, pc_map: Dict[str, Pu
     md.extend(citations)
     return "\n".join(md), agg
 
-# ---------- Compliance (KBase + rules + UI) ----------
+# ---------- Compliance seed ----------
 KBASE_PATH = BASE_DIR / "data" / "compliance_kbase.json"
 SEED_KBASE = {
     "71-43-2": {
         "name": "Benzene",
         "hazards": {"carcinogen": "1A", "mutagen": True, "repro_toxicant": False, "edc": False},
         "lists": {
-            "US (Federal)": {
-                "osha_specific_standard": True,
-                "sara_313": True,
-                "urls": ["https://www.osha.gov/benzene", "https://www.epa.gov/toxics-release-inventory-tri-program"]
-            },
+            "US (Federal)": {"osha_specific_standard": True, "sara_313": True, "urls": ["https://www.osha.gov/benzene", "https://www.epa.gov/toxics-release-inventory-tri-program"]},
             "California (Prop 65)": {"prop65": True, "urls": ["https://oehha.ca.gov/proposition-65"]},
-            "EU (REACH/CLP)": {
-                "clp_carcinogen": "1A",
-                "restriction_annex_xvii": True,
-                "urls": ["https://echa.europa.eu/substance-information/-/substanceinfo/100.028.878"]
-            },
-            "South Africa (HCA/GHS)": {
-                "ghs_classification": "Carc.1A",
-                "permit_required": True,
-                "permit_text": "Storage over 50 L may require a local authority flammable substance permit.",
-                "permit_url": "https://www.labour.gov.za/legislation/acts/occupational-health-and-safety-act",
-                "urls": ["https://www.labour.gov.za/legislation/acts/occupational-health-and-safety-act"]
-            }
-        }
+            "EU (REACH/CLP)": {"clp_carcinogen": "1A", "restriction_annex_xvii": True, "urls": ["https://echa.europa.eu/substance-information/-/substanceinfo/100.028.878"]},
+            "South Africa (HCA/GHS)": {"ghs_classification": "Carc.1A", "permit_required": True, "permit_text": "Storage over 50 L may require a local authority flammable substance permit.", "permit_url": "https://www.labour.gov.za/legislation/acts/occupational-health-and-safety-act", "urls": ["https://www.labour.gov.za/legislation/acts/occupational-health-and-safety-act"]},
+        },
     },
     "117-81-7": {
         "name": "DEHP",
@@ -555,8 +516,8 @@ SEED_KBASE = {
             "US (Federal)": {"tsca_action": True, "urls": ["https://www.epa.gov/assessing-and-managing-chemicals-under-tsca"]},
             "California (Prop 65)": {"prop65": True, "urls": ["https://oehha.ca.gov/proposition-65"]},
             "EU (REACH/CLP)": {"svhc": True, "annex_xiv_authorisation": True, "urls": ["https://echa.europa.eu/candidate-list-table"]},
-            "South Africa (HCA/GHS)": {"ghs_classification": "Repr.1B", "urls": ["https://www.sabs.co.za/"]}
-        }
+            "South Africa (HCA/GHS)": {"ghs_classification": "Repr.1B", "urls": ["https://www.sabs.co.za/"]},
+        },
     },
     "50-00-0": {
         "name": "Formaldehyde",
@@ -565,9 +526,9 @@ SEED_KBASE = {
             "US (Federal)": {"osha_specific_standard": True, "urls": ["https://www.osha.gov/formaldehyde"]},
             "California (Prop 65)": {"prop65": True, "urls": ["https://oehha.ca.gov/proposition-65"]},
             "EU (REACH/CLP)": {"clp_carcinogen": "1B", "urls": ["https://echa.europa.eu/"]},
-            "South Africa (HCA/GHS)": {"ghs_classification": "Carc.1B", "urls": ["https://www.labour.gov.za/"]}
-        }
-    }
+            "South Africa (HCA/GHS)": {"ghs_classification": "Carc.1B", "urls": ["https://www.labour.gov.za/"]},
+        },
+    },
 }
 
 def load_kbase() -> Dict[str, dict]:
@@ -594,12 +555,10 @@ def extract_h_statements(text: str) -> set:
     return set(m.group(0).upper().replace("H", "").replace("I", "I") for m in H_PATTERN.finditer(text))
 
 def infer_flags_from_h(hs: set) -> dict:
-    return {
-        "carcinogen": "1" if any(h in {"350", "350I"} for h in hs) else None,
-        "repro_toxicant": any(h in {"360", "361"} for h in hs),
-        "mutagen": any(h in {"340", "341"} for h in hs),
-        "edc": False
-    }
+    return {"carcinogen": "1" if any(h in {"350", "350I"} for h in hs) else None,
+            "repro_toxicant": any(h in {"360", "361"} for h in hs),
+            "mutagen": any(h in {"340", "341"} for h in hs),
+            "edc": False}
 
 @dataclass
 class Alert:
@@ -702,7 +661,7 @@ def render_alerts(detected_substances: List[Tuple[str, Optional[str]]], jurisdic
 
 # ---------- UI ----------
 st.title("🧪 Zi Safe — SDS Safety Summarizer")
-st.caption("Paste a procedure, fetch SDS, get a safety brief + compliance alerts.")
+st.caption("Build: 2025‑08‑13 • Autofill + AI formatter")
 
 with st.expander("How it works & disclaimer", expanded=False):
     st.markdown("""This tool searches vendor sites for SDS PDFs, extracts relevant sections, and builds a consolidated safety brief.
@@ -731,10 +690,27 @@ with st.sidebar:
     state.compliance_enabled = st.toggle("Enable compliance alerts", value=True)
     state.jurisdiction = st.selectbox("Jurisdiction", ["US (Federal)", "California (Prop 65)", "EU (REACH/CLP)", "South Africa (HCA/GHS)"], index=0)
 
-# ---------- NEW: line‑scoped, non‑overwriting chemicals UI ----------
-st.subheader("Chemicals (edit as needed)")
+# ---------- AI auto-format controls ----------
+st.caption("Need help formatting? Click AI to normalize your text into the exact format this app expects.")
+ai_col1, ai_col2 = st.columns([1,1])
+with ai_col1:
+    run_ai = st.button("✨ AI: Auto‑format procedure", use_container_width=True)
+with ai_col2:
+    use_ai_replace = st.toggle("Replace procedure with AI‑cleaned version", value=False,
+                               help="If ON, your procedure box will be replaced with the normalized version (labels removed).")
 
-# Update defaults only when the procedure text changes
+if run_ai:
+    with st.spinner("AI is formatting your procedure…"):
+        res = ai_autofix_procedure(proc_text)
+    if res:
+        st.session_state["reactants_field"] = res["reactants"]
+        st.session_state["products_field"] = res["products"]
+        st.session_state["solvents_field"] = res["solvents"]
+        if use_ai_replace:
+            proc_text = res["normalized_procedure"]
+            st.session_state["autofill_source_hash"] = None  # force a refresh of defaults
+
+# ---------- One-time autofill when procedure changes ----------
 current_hash = _hash_text(proc_text)
 if st.session_state.get("autofill_source_hash") != current_hash:
     r_default, p_default, s_default = parse_chem_lists(proc_text)
@@ -743,7 +719,8 @@ if st.session_state.get("autofill_source_hash") != current_hash:
     st.session_state["solvents_field"]  = s_default
     st.session_state["autofill_source_hash"] = current_hash
 
-# Three separate fields, semicolon‑normalized
+# ---------- Chemical fields ----------
+st.subheader("Chemicals (edit as needed)")
 reactants = st.text_area(
     "Reactants (semicolon‑separated)",
     key="reactants_field",
@@ -806,6 +783,7 @@ with st.expander("Debug & Manual SDS input", expanded=False):
     st.write("Paste one or more SDS PDF URLs (one per line). These will be used in addition to search results.")
     manual_urls = st.text_area("SDS PDF URLs", height=100, placeholder="https://...pdf\nhttps://...pdf")
 
+# ---------- Run search & summarizer ----------
 run = st.button("🔎 Fetch SDS & Summarize", type="primary", disabled=(len(chemical_list) == 0))
 
 results_docs: List[SDSDoc] = []
@@ -813,7 +791,7 @@ status_placeholder = st.empty()
 
 if run:
     if not SERPAPI_KEY:
-        st.error("SERPAPI_KEY missing. On Streamlit Cloud, set it in Secrets. Locally, add it to .env.")
+        st.error("SERPAPI_KEY missing. On Streamlit Cloud, set it in Secrets. Locally, add it to .env or .streamlit/secrets.toml.")
     else:
         with st.spinner("Searching SDS and building your safety brief…"):
             # Search via SerpAPI
@@ -836,7 +814,7 @@ if run:
                 if not chosen:
                     status_placeholder.warning(f"No SDS PDF found or downloadable for {chem}. Try adjusting the name or suppliers.")
 
-            # Manual URL handling (guarantees a report path)
+            # Manual URL handling
             extra_links = [u.strip() for u in (manual_urls or "").splitlines() if u.strip()]
             for link in extra_links:
                 fpath = download_pdf(link)
@@ -851,18 +829,82 @@ if run:
 
             status_placeholder.empty()
 
-# Render compliance + summary
+# ---------- Render results ----------
 if results_docs:
-    # Build (name, cas) for alerts using PubChem & KBase name index
+    # PubChem normalization
     pc_map: Dict[str, PubChemInfo] = {}
     if chemical_list and state.use_pubchem_normalize:
         with st.spinner("Querying PubChem for canonical names & GHS…"):
-            pc_map = normalize_via_pubchem(chemical_list)
+            # minimal PubChem calls to avoid rate limits
+            def pubchem_name_to_cid(name: str) -> Optional[int]:
+                try:
+                    r = requests.get(
+                        f"https://pubchem.ncbi.nlm.nih.gov/rest/pug/compound/name/{requests.utils.quote(name)}/cids/JSON",
+                        headers=HEADERS, timeout=TIMEOUT)
+                    if r.status_code != 200:
+                        return None
+                    cids = r.json().get("IdentifierList", {}).get("CID", [])
+                    return cids[0] if cids else None
+                except Exception:
+                    return None
 
+            def pubchem_cid_summary(cid: int):
+                info = PubChemInfo(name_input=str(cid), cid=cid)
+                try:
+                    r = requests.get(f"https://pubchem.ncbi.nlm.nih.gov/rest/pug_view/data/compound/{cid}/JSON/",
+                                     headers=HEADERS, timeout=TIMEOUT)
+                    if r.status_code != 200:
+                        return info
+                    record = r.json().get("Record", {})
+                    sections = record.get("Section", [])
+                    def find_sec(lst, name):
+                        for s in lst:
+                            if s.get("TOCHeading") == name: return s
+                        return None
+                    comp_id = find_sec(sections, "Names and Identifiers")
+                    if comp_id:
+                        for s in comp_id.get("Section", []):
+                            if s.get("TOCHeading") == "IUPAC Name":
+                                for it in s.get("Information", []):
+                                    info.iupac_name = it.get("Value", {}).get("StringWithMarkup", [{}])[0].get("String")
+                            if s.get("TOCHeading") == "Synonyms":
+                                for it in s.get("Information", []):
+                                    for v in it.get("Value", {}).get("StringWithMarkup", []):
+                                        sv = v.get("String"); 
+                                        if sv: info.synonyms.append(sv)
+                            if s.get("TOCHeading") == "Record Title":
+                                for it in s.get("Information", []):
+                                    info.canonical_name = it.get("Value", {}).get("StringWithMarkup", [{}])[0].get("String")
+                    safety = find_sec(sections, "Safety and Hazards")
+                    if safety:
+                        for s in safety.get("Section", []):
+                            if s.get("TOCHeading") == "GHS Classification":
+                                for it in s.get("Information", []):
+                                    for tb in it.get("Value", {}).get("StringWithMarkup", []):
+                                        for code in re.findall(r"\bH\d{3}\b", tb.get("String", "")):
+                                            if code not in info.ghs_hcodes:
+                                                info.ghs_hcodes.append(code)
+                except Exception:
+                    pass
+                info.synonyms = sorted(set(info.synonyms))[:50]
+                return info
+
+            for n in chemical_list:
+                cid = pubchem_name_to_cid(n)
+                pc_map[n] = pubchem_cid_summary(cid) if cid else PubChemInfo(name_input=n)
+                pc_map[n].name_input = n
+
+    # Compliance alerts
     detected_substances: List[Tuple[str, Optional[str]]] = []
     for chem in chemical_list:
         info = pc_map.get(chem)
-        cas = best_cas_from_pubchem(info) if info else None
+        # try to infer CAS from PubChem synonyms or KBASE index
+        cas = None
+        if info:
+            for s in info.synonyms:
+                s2 = s.strip()
+                if re.match(r"^\d{2,7}-\d{2}-\d$", s2):
+                    cas = s2; break
         if not cas:
             name_key = (info.canonical_name or chem).strip().lower() if info else chem.strip().lower()
             cas = KBASE_NAME_INDEX.get(name_key)
@@ -874,7 +916,6 @@ if results_docs:
     md_summary, _ = consolidate_summary(results_docs, proc_text, pc_map)
     st.subheader("Consolidated Safety Summary")
     st.markdown(md_summary)
-
     st.download_button("💾 Download Markdown", data=md_summary.encode("utf-8"), file_name="zi_safe_safety_brief.md")
 
     st.subheader("SDS Sources Found")
