@@ -1,0 +1,13 @@
+﻿# Python / Streamlit
+.venv/
+__pycache__/
+.env
+
+# App cache
+sds_cache/
+
+# OS/editor files
+*.DS_Store
+
+# You already removed this from tracking; keep it ignored
+zi-safe/
