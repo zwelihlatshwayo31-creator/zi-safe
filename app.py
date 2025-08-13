@@ -1,26 +1,16 @@
 """
 Zi Safe — SDS Safety Summarizer (Streamlit + SerpAPI + PubChem)
-
-- Paste a chemistry procedure
-- Detect chemicals (reactants/products/solvents)
-- Fetch SDS PDFs via SerpAPI (Google results restricted to supplier domains)
-- Parse hazard/PPE/handling/first-aid/etc. sections
-- Cross-check GHS H-codes via PubChem
-- Output a consolidated safety brief
-
-NOTE: Always verify against original SDS and your institution’s EHS policies.
+Includes: Compliance Alerts + Debug panel + Manual SDS URL input
 """
 
-# -----------------------
-# Imports & setup
-# -----------------------
 import os
 import re
 import json
 import time
 import hashlib
+import pathlib
 from dataclasses import dataclass
-from typing import List, Dict, Tuple, Optional  # 3.8+ compatible
+from typing import List, Dict, Tuple, Optional
 from urllib.parse import urlparse, unquote
 
 import requests
@@ -30,10 +20,9 @@ from pdfminer.high_level import extract_text
 from pydantic import BaseModel, Field
 from rapidfuzz import fuzz
 
-# Load .env (for local runs); on Streamlit Cloud we’ll read from st.secrets
+# ---------- Setup ----------
 load_dotenv()
 
-# Helper: work both locally (.env) and on Streamlit Cloud (st.secrets)
 def get_secret(name: str, default: str = ""):
     try:
         return st.secrets.get(name, os.getenv(name, default))
@@ -41,22 +30,19 @@ def get_secret(name: str, default: str = ""):
         return os.getenv(name, default)
 
 SERPAPI_KEY = get_secret("SERPAPI_KEY", "")
-
-# -----------------------
-# Config & constants
-# -----------------------
 st.set_page_config(page_title="Zi Safe", page_icon="🧪", layout="wide")
 
-CACHE_DIR = os.path.join(os.path.dirname(__file__), "sds_cache")
-os.makedirs(CACHE_DIR, exist_ok=True)
+BASE_DIR = pathlib.Path(__file__).parent
+CACHE_DIR = BASE_DIR / "sds_cache"
+CACHE_DIR.mkdir(exist_ok=True)
 
 DEFAULT_SUPPLIERS = [
     "sigmaaldrich.com", "fishersci.com", "alfa.com", "vwr.com", "caymanchem.com",
     "thermofisher.com", "oakwoodchemical.com", "spectrumchemical.com", "tcichemicals.com",
-    "acros.com", "strem.com", "merckmillipore.com"
+    "acros.com", "strem.com", "merckmillipore.com",
 ]
 
-USER_AGENT = "ZiSafe/1.5 (+local)"
+USER_AGENT = "ZiSafe/1.8"
 TIMEOUT = 25
 HEADERS = {"User-Agent": USER_AGENT}
 
@@ -79,12 +65,10 @@ OPERATION_CUES = {
     "pressurized": ["pressure", "autoclave", "sealed tube"],
     "exotherm": ["exotherm", "vigorous", "add slowly", "cooling bath", "ice bath"],
     "volatile": ["diethyl ether", "hexane", "acetone", "dichloromethane", "chloroform", "acetonitrile"],
-    "cryogenic": ["dry ice", "liquid nitrogen"]
+    "cryogenic": ["dry ice", "liquid nitrogen"],
 }
 
-# -----------------------
-# Models
-# -----------------------
+# ---------- Models ----------
 @dataclass
 class SDSDoc:
     chemical: str
@@ -103,16 +87,15 @@ class PubChemInfo(BaseModel):
 
 class AppState(BaseModel):
     procedure_text: str = Field("")
-    chemical_list: List[str] = Field(default_factory=list)
     suppliers: List[str] = Field(default_factory=lambda: DEFAULT_SUPPLIERS)
     use_pubchem_normalize: bool = Field(default=True)
     max_results: int = Field(default=12)
     max_chemicals: int = Field(default=20)
     delay_s: float = Field(default=0.3)
+    jurisdiction: str = Field(default="US (Federal)")
+    compliance_enabled: bool = Field(default=True)
 
-# -----------------------
-# Helper: supplier inference (3.8-compatible)
-# -----------------------
+# ---------- Helpers ----------
 def guess_supplier_from_url(url: str, custom_map: Optional[Dict[str, str]] = None) -> Optional[str]:
     if not url or not isinstance(url, str):
         return None
@@ -120,63 +103,31 @@ def guess_supplier_from_url(url: str, custom_map: Optional[Dict[str, str]] = Non
         p = urlparse(url.strip())
     except Exception:
         return None
-
-    host = (p.netloc or "").lower()
+    host = (p.netloc or "").lower().replace("www.", "").replace("m.", "")
     path = unquote((p.path or "").lower())
-    host = host.replace("www.", "").replace("m.", "")
 
-    generic_hosts = {
-        "drive.google.com", "docs.google.com", "google.com",
-        "dropbox.com", "dl.dropboxusercontent.com",
-        "onedrive.live.com", "1drv.ms",
-        "sharepoint.com", "box.com", "app.box.com",
-        "github.com", "gitlab.com", "bitbucket.org",
-        "readthedocs.io", "medium.com", "wikipedia.org",
-        "scholar.google.com", "bing.com", "yahoo.com",
-        "archive.org", "scribd.com"
+    generic = {
+        "drive.google.com", "docs.google.com", "google.com", "dropbox.com", "dl.dropboxusercontent.com",
+        "onedrive.live.com", "1drv.ms", "sharepoint.com", "box.com", "app.box.com", "github.com",
+        "gitlab.com", "bitbucket.org", "readthedocs.io", "medium.com", "wikipedia.org",
+        "scholar.google.com", "bing.com", "yahoo.com", "archive.org", "scribd.com",
     }
-    if any(host == gh or host.endswith("." + gh) for gh in generic_hosts):
+    if any(host == gh or host.endswith("." + gh) for gh in generic):
         return None
 
     fragment_map = {
         "sigmaaldrich": "Sigma-Aldrich (Merck)",
         "sigma-aldrich": "Sigma-Aldrich (Merck)",
         "merckmillipore": "Merck",
-        "millipore": "Merck",
-        "merckgroup": "Merck",
         "merck": "Merck",
-        "supelco": "Supelco (Merck)",
+        "fishersci": "Fisher Scientific (Thermo)",
         "thermofisher": "Thermo Fisher Scientific",
-        "thermo-fisher": "Thermo Fisher Scientific",
-        "thermo": "Thermo Fisher Scientific",
-        "fishersci": "Fisher Scientific (Thermo Fisher)",
-        "fisherbrand": "Fisherbrand (Thermo Fisher)",
-        "alfa": "Alfa Aesar (Thermo Fisher)",
-        "alfa-aesar": "Alfa Aesar (Thermo Fisher)",
-        "acros": "Acros Organics (Thermo Fisher)",
+        "alfa": "Alfa Aesar (Thermo)",
+        "acros": "Acros Organics (Thermo)",
         "tcichemicals": "TCI Chemicals",
-        "tci-chemicals": "TCI Chemicals",
-        "tcichemical": "TCI Chemicals",
-        "tci": "TCI Chemicals",
         "vwr": "VWR (Avantor)",
-        "avantor": "Avantor",
-        "avantorsciences": "Avantor",
-        "macron": "Macron Fine Chemicals (Avantor)",
         "spectrumchemical": "Spectrum Chemical",
-        "coleparmer": "Cole-Parmer",
         "carlroth": "Carl Roth",
-        "scharlab": "Scharlab",
-        "scharlau": "Scharlau (Scharlab)",
-        "basf": "BASF",
-        "dow": "Dow",
-        "dupont": "DuPont",
-        "evonik": "Evonik",
-        "arkema": "Arkema",
-        "solvay": "Solvay",
-        "clariant": "Clariant",
-        "croda": "Croda",
-        "lubrizol": "Lubrizol",
-        "3m": "3M",
         "honeywell": "Honeywell Research Chemicals",
         "fluka": "Fluka (Honeywell)",
         "aldrich": "Sigma-Aldrich (Merck)",
@@ -188,42 +139,32 @@ def guess_supplier_from_url(url: str, custom_map: Optional[Dict[str, str]] = Non
     if custom_map:
         fragment_map.update({k.lower(): v for k, v in custom_map.items()})
 
-    def tokenize(s: str) -> List[str]:
-        return re.split(r"[.\-/ _]+", s)
-
-    tokens = tokenize(host) + tokenize(path)
-
-    for frag in sorted(fragment_map.keys(), key=len, reverse=True):
+    tokens = re.split(r"[.\-/ _]+", host) + re.split(r"[.\-/ _]+", path)
+    for frag in sorted(fragment_map, key=len, reverse=True):
         if any(frag in t for t in tokens):
             return fragment_map[frag]
 
-    domain_bits = host.split(".")
-    if len(domain_bits) >= 2:
-        tld2 = ".".join(domain_bits[-2:])
-        if tld2 in {"co.za", "com.au", "co.uk", "com.mx", "com.br"} and len(domain_bits) >= 3:
-            base = domain_bits[-3]
+    parts = host.split(".")
+    if len(parts) >= 2:
+        tld2 = ".".join(parts[-2:])
+        if tld2 in {"co.za", "com.au", "co.uk", "com.mx", "com.br"} and len(parts) >= 3:
+            base = parts[-3]
         else:
-            base = domain_bits[-2] if domain_bits[-1] in {"com", "org", "net"} else domain_bits[0]
+            base = parts[-2] if parts[-1] in {"com", "org", "net"} else parts[0]
     else:
-        base = domain_bits[0] if domain_bits else ""
+        base = parts[0] if parts else ""
 
     base = re.sub(r"[^a-z0-9]+", " ", base).strip()
-    if not base:
-        return None
-    if base in {"files", "storage", "cdn", "assets"}:
+    if not base or base in {"files", "storage", "cdn", "assets"}:
         return None
 
     supplier = " ".join(w.capitalize() for w in base.split())
-    fixes = {"3m": "3M", "Dow": "Dow", "Basf": "BASF", "Dupont": "DuPont", "Aeci": "AECI",
-             "Tci": "TCI", "Vwr": "VWR", "Sds": "SDS", "Sasol": "Sasol"}
+    fixes = {"3m": "3M", "Dow": "Dow", "Basf": "BASF", "Dupont": "DuPont", "Aeci": "AECI", "Tci": "TCI", "Vwr": "VWR", "Sds": "SDS", "Sasol": "Sasol"}
     return fixes.get(supplier, supplier) or None
 
-# -----------------------
-# Chemical detection
-# -----------------------
 CHEM_REGEXES = [
-    r"\b([A-Z][a-z]+\s+[A-Z][a-z]+)\b",      # Sodium chloride
-    r"\b([A-Z][a-z]+\s+\(.+?\))\b",          # Sodium (metal)
+    r"\b([A-Z][a-z]+\s+[A-Z][a-z]+)\b",
+    r"\b([A-Z][a-z]+\s+\(.+?\))\b",
     r"\b([A-Z][a-z]+(?:\s+[A-Za-z0-9\-]+){0,3})\s*(?:solution|aq\.|anhydrous)?\b",
     r"\b([A-Za-z0-9\-]+\s*acid)\b",
     r"\b([A-Za-z0-9\-]+\s*oxide)\b",
@@ -235,12 +176,10 @@ CHEM_REGEXES = [
     r"\b([A-Za-z0-9\-]+\s*sulfate)\b",
     r"\b([A-Za-z0-9\-]+\s*sulphate)\b",
 ]
-
 COMMON_NON_CHEM = {"water", "ice", "air", "nitrogen", "argon", "vacuum", "steam"}
 
 def cap_title(name: str) -> str:
-    parts = name.split()
-    return " ".join(p.capitalize() if not p.isupper() else p for p in parts)
+    return " ".join(p.capitalize() if not p.isupper() else p for p in name.split())
 
 def detect_chemicals(text: str) -> List[str]:
     found = set()
@@ -254,38 +193,36 @@ def detect_chemicals(text: str) -> List[str]:
             if name_norm in COMMON_NON_CHEM:
                 continue
             found.add(name_norm)
-    cleaned = sorted({cap_title(n) for n in found})
-    return cleaned[:25]
+    return sorted({cap_title(n) for n in found})[:25]
 
-# -----------------------
-# Search & download (SerpAPI)
-# -----------------------
+# ---------- Search & PDF ----------
 def search_sds_serpapi(chemical: str, suppliers: List[str], num: int = 12):
     if not SERPAPI_KEY:
         return []
-    domain_query = " OR ".join([f"site:{d}" for d in suppliers])
-    q = f"{chemical} SDS filetype:pdf ({domain_query})"
-    url = "https://serpapi.com/search.json"
-    params = {"engine": "google", "q": q, "num": num, "api_key": SERPAPI_KEY}
+    q = f"{chemical} SDS filetype:pdf (" + " OR ".join([f"site:{d}" for d in suppliers]) + ")"
     try:
-        r = requests.get(url, params=params, headers=HEADERS, timeout=TIMEOUT)
+        r = requests.get(
+            "https://serpapi.com/search.json",
+            params={"engine": "google", "q": q, "num": num, "api_key": SERPAPI_KEY},
+            headers=HEADERS,
+            timeout=TIMEOUT,
+        )
         r.raise_for_status()
         data = r.json()
         results = []
         for item in data.get("organic_results", []):
             link = item.get("link", "")
-            title = item.get("title", "")
             if isinstance(link, str) and link.lower().endswith(".pdf"):
-                results.append((title, link))
+                results.append((item.get("title", ""), link))
         return results
     except Exception:
         return []
 
 def download_pdf(url: str) -> Optional[str]:
     h = hashlib.sha256(url.encode("utf-8")).hexdigest()[:16]
-    fpath = os.path.join(CACHE_DIR, f"{h}.pdf")
-    if os.path.exists(fpath) and os.path.getsize(fpath) > 0:
-        return fpath
+    fpath = CACHE_DIR / f"{h}.pdf"
+    if fpath.exists() and fpath.stat().st_size > 0:
+        return str(fpath)
     try:
         with requests.get(url, headers=HEADERS, timeout=TIMEOUT, stream=True) as resp:
             ctype = resp.headers.get("Content-Type", "").lower()
@@ -293,14 +230,14 @@ def download_pdf(url: str) -> Optional[str]:
                 return None
             resp.raise_for_status()
             with open(fpath, "wb") as f:
-                for chunk in resp.iter_content(chunk_size=8192):
+                for chunk in resp.iter_content(8192):
                     if chunk:
                         f.write(chunk)
-        return fpath
+        return str(fpath)
     except Exception:
-        if os.path.exists(fpath):
+        if fpath.exists():
             try:
-                os.remove(fpath)
+                fpath.unlink()
             except Exception:
                 pass
         return None
@@ -311,27 +248,25 @@ def extract_pdf_text(fpath: str) -> str:
     except Exception:
         return ""
 
-# -----------------------
-# PubChem normalization & GHS
-# -----------------------
+# ---------- PubChem ----------
 PUBCHEM_BASE = "https://pubchem.ncbi.nlm.nih.gov/rest"
-
-class PubChemError(Exception):
-    pass
 
 def pubchem_name_to_cid(name: str) -> Optional[int]:
     try:
         r = requests.get(
             f"{PUBCHEM_BASE}/pug/compound/name/{requests.utils.quote(name)}/cids/JSON",
-            headers=HEADERS, timeout=TIMEOUT
+            headers=HEADERS,
+            timeout=TIMEOUT,
         )
         if r.status_code != 200:
             return None
-        data = r.json()
-        cids = data.get("IdentifierList", {}).get("CID", [])
+        cids = r.json().get("IdentifierList", {}).get("CID", [])
         return cids[0] if cids else None
     except Exception:
         return None
+
+class PubChemInfoError(Exception):
+    pass
 
 def pubchem_cid_summary(cid: int):
     info = PubChemInfo(name_input=str(cid), cid=cid)
@@ -339,17 +274,16 @@ def pubchem_cid_summary(cid: int):
         r = requests.get(f"{PUBCHEM_BASE}/pug_view/data/compound/{cid}/JSON/", headers=HEADERS, timeout=TIMEOUT)
         if r.status_code != 200:
             return info
-        data = r.json()
-        record = data.get("Record", {})
+        record = r.json().get("Record", {})
         sections = record.get("Section", [])
 
-        def find_sections(sec_list, name):
-            for s in sec_list:
+        def find_sec(lst, name):
+            for s in lst:
                 if s.get("TOCHeading") == name:
                     return s
             return None
 
-        comp_id = find_sections(sections, "Names and Identifiers")
+        comp_id = find_sec(sections, "Names and Identifiers")
         if comp_id:
             for s in comp_id.get("Section", []):
                 if s.get("TOCHeading") == "IUPAC Name":
@@ -357,30 +291,22 @@ def pubchem_cid_summary(cid: int):
                         info.iupac_name = it.get("Value", {}).get("StringWithMarkup", [{}])[0].get("String")
                 if s.get("TOCHeading") == "Synonyms":
                     for it in s.get("Information", []):
-                        vals = it.get("Value", {}).get("StringWithMarkup", [])
-                        for v in vals:
-                            sname = v.get("String")
-                            if sname:
-                                info.synonyms.append(sname)
+                        for v in it.get("Value", {}).get("StringWithMarkup", []):
+                            sv = v.get("String")
+                            if sv:
+                                info.synonyms.append(sv)
                 if s.get("TOCHeading") == "Record Title":
                     for it in s.get("Information", []):
                         info.canonical_name = it.get("Value", {}).get("StringWithMarkup", [{}])[0].get("String")
-
-        safety = find_sections(sections, "Safety and Hazards")
+        safety = find_sec(sections, "Safety and Hazards")
         if safety:
-            ghs = None
             for s in safety.get("Section", []):
                 if s.get("TOCHeading") == "GHS Classification":
-                    ghs = s
-                    break
-            if ghs:
-                for it in ghs.get("Information", []):
-                    textblocks = it.get("Value", {}).get("StringWithMarkup", [])
-                    for tb in textblocks:
-                        s = tb.get("String", "")
-                        for code in re.findall(r"\bH\d{3}\b", s):
-                            if code not in info.ghs_hcodes:
-                                info.ghs_hcodes.append(code)
+                    for it in s.get("Information", []):
+                        for tb in it.get("Value", {}).get("StringWithMarkup", []):
+                            for code in re.findall(r"\bH\d{3}\b", tb.get("String", "")):
+                                if code not in info.ghs_hcodes:
+                                    info.ghs_hcodes.append(code)
     except Exception:
         pass
     info.synonyms = sorted(set(info.synonyms))[:50]
@@ -390,43 +316,39 @@ def normalize_via_pubchem(names: List[str]) -> Dict[str, PubChemInfo]:
     out: Dict[str, PubChemInfo] = {}
     for n in names:
         cid = pubchem_name_to_cid(n)
-        if cid:
-            out[n] = pubchem_cid_summary(cid)
-            out[n].name_input = n
-        else:
-            out[n] = PubChemInfo(name_input=n)
+        out[n] = pubchem_cid_summary(cid) if cid else PubChemInfo(name_input=n)
+        out[n].name_input = n
     return out
 
-# -----------------------
-# SDS parsing & consolidation
-# -----------------------
+# ---------- SDS parsing & consolidation ----------
 def split_sections(text: str) -> Dict[str, str]:
     sections: Dict[str, str] = {}
     t = re.sub(r"\r", "", text)
     pattern = re.compile(r"(?im)^\s*(section\s*(\d{1,2})\s*[:\-–]\s*)(.+?)$")
-    indices: List[Tuple[int, int, int, str]] = []
+    indices: List[Tuple[int, int, str]] = []
     for m in pattern.finditer(t):
         start = m.start()
         secno = int(m.group(2))
         title = m.group(3).strip()
-        indices.append((start, 0, secno, title))
+        indices.append((start, secno, title))
     ends = [i[0] for i in indices] + [len(t)]
-    chunks = {}
-    for idx, (start, _, secno, title) in enumerate(indices):
-        end = ends[idx+1]
-        chunk = t[start:end].strip()
-        chunks[f"section_{secno}"] = chunk
+    chunks: Dict[str, str] = {}
+    for idx, (start, secno, title) in enumerate(indices):
+        end = ends[idx + 1]
+        chunks[f"section_{secno}"] = t[start:end].strip()
+
     for key, hints in SECTION_HINTS:
+        best = None
         best_score = -1
-        best_sec = None
         for sname, chunk in chunks.items():
             head = chunk.split("\n", 1)[0]
             score = max([fuzz.partial_ratio(head.lower(), h.lower()) for h in hints] + [0])
             if score > best_score:
                 best_score = score
-                best_sec = sname
-        if best_sec:
-            sections[key] = chunks[best_sec]
+                best = sname
+        if best:
+            sections[key] = chunks[best]
+
     if not sections:
         for key, hints in SECTION_HINTS:
             for h in hints:
@@ -466,34 +388,35 @@ def extract_key_points(sections: Dict[str, str]) -> Dict[str, List[str]]:
         points[key] = uniq[:25]
     return points
 
-def procedure_risk_hints(proc_text: str) -> List[str]:
-    tips = []
-    low = proc_text.lower()
-    def has(pat):
+def procedure_risk_hints(proc: str) -> List[str]:
+    tips: List[str] = []
+    low = proc.lower()
+
+    def has(pat: str) -> bool:
         if "*" in pat:
-            pat = pat.replace("*", ".*")
-            return re.search(pat, low) is not None
+            return re.search(pat.replace("*", ".*"), low) is not None
         return pat in low
+
     if any(has(c) for c in OPERATION_CUES["heating"]):
-        tips.append("Heating/reflux: check flash points; use a condenser; avoid open flames; heat‑resistant gloves.")
+        tips.append("Heating/reflux: check flash points; use condenser; avoid flames; heat‑resistant gloves.")
     if any(has(c) for c in OPERATION_CUES["acid_base"]):
-        tips.append("Acid/base steps: ALWAYS add acid to water; control exotherms with an ice bath; monitor pH; beware gas evolution.")
+        tips.append("Acid/base: add acid to water; control exotherms; monitor pH; beware gas evolution.")
     if any(has(c) for c in OPERATION_CUES["oxidizer"]):
-        tips.append("Oxidizers: segregate from organics/reducers; use non‑sparking tools; quench carefully.")
+        tips.append("Oxidizers: segregate; non‑sparking tools; quench carefully.")
     if any(has(c) for c in OPERATION_CUES["reducing"]):
-        tips.append("Strong reducing agents/hydrides: exclude moisture/air; add slowly under inert atmosphere; keep Class D extinguishing media accessible.")
+        tips.append("Hydrides/reducers: exclude moisture/air; slow addition; Class D extinguisher nearby.")
     if any(has(c) for c in OPERATION_CUES["pressurized"]):
-        tips.append("Pressurized/closed systems: rated glassware/autoclaves; shields; pressure relief; leak‑check before heating.")
+        tips.append("Closed/pressurized: rated vessels; shields; relief; leak‑check.")
     if any(has(c) for c in OPERATION_CUES["exotherm"]):
-        tips.append("Exothermic addition: dosing control; pre‑cool; verify heat removal capacity.")
+        tips.append("Exotherms: dosing control; pre‑cool; verify heat removal.")
     if any(has(c) for c in OPERATION_CUES["volatile"]):
-        tips.append("Volatile solvents: fume hood; adequate ventilation; ground/bond during transfers.")
+        tips.append("Volatile solvents: fume hood; ventilation; ground/bond transfers.")
     if any(has(c) for c in OPERATION_CUES["cryogenic"]):
-        tips.append("Cryogens: face shield; insulated gloves; dewars; prevent asphyxiation risks.")
+        tips.append("Cryogens: face shield; insulated gloves; dewars; prevent asphyxiation.")
     return tips
 
 def dedupe_ordered(items: List[str]) -> List[str]:
-    seen = []
+    seen: List[str] = []
     for it in items:
         if not any(fuzz.partial_ratio(it, s) > 92 for s in seen):
             seen.append(it)
@@ -506,22 +429,20 @@ def consolidate_summary(docs: List[SDSDoc], proc_text: str, pc_map: Dict[str, Pu
     for doc in docs:
         sections = split_sections(doc.text)
         points = extract_key_points(sections)
-        pc = pc_map.get(doc.chemical) or next((pc_map[k] for k in pc_map if k.lower()==doc.chemical.lower()), None)
+        pc = pc_map.get(doc.chemical) or next((pc_map[k] for k in pc_map if k.lower() == doc.chemical.lower()), None)
         if pc and pc.ghs_hcodes:
             sds_codes = set()
             for v in points.get("hazard", []):
                 sds_codes.update(re.findall(r"H\d{3}", v))
             miss = [c for c in pc.ghs_hcodes if c not in sds_codes]
             if miss:
-                ghs_notes.append(f"[{doc.chemical}] PubChem additional GHS codes not seen in extracted SDS: {', '.join(sorted(set(miss)))} (verify).")
+                ghs_notes.append(f"[{doc.chemical}] PubChem extra GHS not in SDS text: {', '.join(sorted(set(miss)))} (verify).")
         for key, vals in points.items():
             for v in vals:
-                tag = f"[{doc.chemical} – {doc.supplier}] "
-                agg[key].append(tag + v)
+                agg[key].append(f"[{doc.chemical} – {doc.supplier}] " + v)
         citations.append(f"- {doc.chemical} – {doc.url}")
     order = ["hazard", "exposure_ppe", "handling_storage", "accidental_release", "first_aid", "fire_fighting", "stability_reactivity", "toxicology"]
-    md = ["# Safety Brief (Auto‑generated from SDS)"]
-    md.append("\n**NOTE:** Always verify against original SDS and local EHS policies.")
+    md = ["# Safety Brief (Auto‑generated from SDS)", "\n**NOTE:** Verify against original SDS and local EHS policies."]
     if proc_text.strip():
         md.append("\n## Procedure‑aware cautions")
         for t in procedure_risk_hints(proc_text):
@@ -531,88 +452,261 @@ def consolidate_summary(docs: List[SDSDoc], proc_text: str, pc_map: Dict[str, Pu
         for n in ghs_notes:
             md.append(f"- {n}")
     for key in order:
-        pretty = key.replace("_", " ").title()
         items = dedupe_ordered(agg.get(key, []))[:25]
         if items:
-            md.append(f"\n## {pretty}")
-            for it in items:
-                md.append(f"- {it}")
+            md.append(f"\n## {key.replace('_', ' ').title()}")
+            md.extend(f"- {it}" for it in items)
     md.append("\n## Sources")
     md.extend(citations)
     return "\n".join(md), agg
 
-# -----------------------
-# UI
-# -----------------------
+# ---------- Compliance (KBase + rules + UI) ----------
+KBASE_PATH = BASE_DIR / "data" / "compliance_kbase.json"
+SEED_KBASE = {
+    "71-43-2": {
+        "name": "Benzene",
+        "hazards": {"carcinogen": "1A", "mutagen": True, "repro_toxicant": False, "edc": False},
+        "lists": {
+            "US (Federal)": {
+                "osha_specific_standard": True,
+                "sara_313": True,
+                "urls": ["https://www.osha.gov/benzene", "https://www.epa.gov/toxics-release-inventory-tri-program"]
+            },
+            "California (Prop 65)": {"prop65": True, "urls": ["https://oehha.ca.gov/proposition-65"]},
+            "EU (REACH/CLP)": {
+                "clp_carcinogen": "1A",
+                "restriction_annex_xvii": True,
+                "urls": ["https://echa.europa.eu/substance-information/-/substanceinfo/100.028.878"]
+            },
+            "South Africa (HCA/GHS)": {
+                "ghs_classification": "Carc.1A",
+                "permit_required": True,
+                "permit_text": "Storage over 50 L may require a local authority flammable substance permit.",
+                "permit_url": "https://www.labour.gov.za/legislation/acts/occupational-health-and-safety-act",
+                "urls": ["https://www.labour.gov.za/legislation/acts/occupational-health-and-safety-act"]
+            }
+        }
+    },
+    "117-81-7": {
+        "name": "DEHP",
+        "hazards": {"carcinogen": "2", "mutagen": False, "repro_toxicant": True, "edc": True},
+        "lists": {
+            "US (Federal)": {"tsca_action": True, "urls": ["https://www.epa.gov/assessing-and-managing-chemicals-under-tsca"]},
+            "California (Prop 65)": {"prop65": True, "urls": ["https://oehha.ca.gov/proposition-65"]},
+            "EU (REACH/CLP)": {"svhc": True, "annex_xiv_authorisation": True, "urls": ["https://echa.europa.eu/candidate-list-table"]},
+            "South Africa (HCA/GHS)": {"ghs_classification": "Repr.1B", "urls": ["https://www.sabs.co.za/"]}
+        }
+    },
+    "50-00-0": {
+        "name": "Formaldehyde",
+        "hazards": {"carcinogen": "1B", "mutagen": True, "repro_toxicant": False, "edc": False},
+        "lists": {
+            "US (Federal)": {"osha_specific_standard": True, "urls": ["https://www.osha.gov/formaldehyde"]},
+            "California (Prop 65)": {"prop65": True, "urls": ["https://oehha.ca.gov/proposition-65"]},
+            "EU (REACH/CLP)": {"clp_carcinogen": "1B", "urls": ["https://echa.europa.eu/"]},
+            "South Africa (HCA/GHS)": {"ghs_classification": "Carc.1B", "urls": ["https://www.labour.gov.za/"]}
+        }
+    }
+}
+
+def load_kbase() -> Dict[str, dict]:
+    data = {}
+    try:
+        if KBASE_PATH.exists():
+            with KBASE_PATH.open("r", encoding="utf-8") as f:
+                j = json.load(f)
+                if isinstance(j, dict):
+                    data.update(j)
+    except Exception:
+        pass
+    for k, v in SEED_KBASE.items():
+        data.setdefault(k, v)
+    return data
+
+KBASE = load_kbase()
+KBASE_NAME_INDEX = {(rec.get("name", "").strip().lower()): cas for cas, rec in KBASE.items() if rec.get("name")}
+H_PATTERN = re.compile(r"\bH(3\d{2}|4\d{2})i?\b", re.IGNORECASE)
+
+def extract_h_statements(text: str) -> set:
+    if not text:
+        return set()
+    return set(m.group(0).upper().replace("H", "").replace("I", "I") for m in H_PATTERN.finditer(text))
+
+def infer_flags_from_h(hs: set) -> dict:
+    return {
+        "carcinogen": "1" if any(h in {"350", "350I"} for h in hs) else None,
+        "repro_toxicant": any(h in {"360", "361"} for h in hs),
+        "mutagen": any(h in {"340", "341"} for h in hs),
+        "edc": False
+    }
+
+@dataclass
+class Alert:
+    level: str
+    substance: str
+    cas: str
+    messages: List[str]
+    links: List[str]
+
+def lookup_kbase(cas: Optional[str], name: Optional[str]) -> Optional[dict]:
+    if cas and cas in KBASE:
+        return KBASE[cas]
+    if name:
+        cas2 = KBASE_NAME_INDEX.get(name.strip().lower())
+        if cas2 in KBASE:
+            return KBASE[cas2]
+    return None
+
+def best_cas_from_pubchem(info: Optional[PubChemInfo]) -> Optional[str]:
+    if not info:
+        return None
+    for s in info.synonyms:
+        s = s.strip()
+        if re.match(r"^\d{2,7}-\d{2}-\d$", s):
+            return s
+    return None
+
+def evaluate_substance(sub_name: str, cas: Optional[str], jurisdiction: str, h_codes: set) -> Optional[Alert]:
+    k = lookup_kbase(cas, sub_name)
+    messages: List[str] = []
+    links: List[str] = []
+    level = "info"
+
+    inferred = infer_flags_from_h(h_codes) if h_codes else {}
+    if inferred.get("carcinogen"):
+        level = "warning"; messages.append("Classified as carcinogenic (H350 detected in SDS).")
+    if inferred.get("repro_toxicant"):
+        level = "warning"; messages.append("Reproductive / endocrine concern (H360/H361 detected in SDS).")
+    if inferred.get("mutagen"):
+        level = "warning"; messages.append("Mutagenicity concern (H340/H341 detected in SDS).")
+
+    if k:
+        hz = k.get("hazards", {})
+        if hz.get("carcinogen") in {"1", "1A", "1B"}:
+            level = "warning"; messages.append(f"Carcinogen category {hz['carcinogen']} (authoritative list).")
+        if hz.get("repro_toxicant") or hz.get("edc"):
+            level = "warning"; messages.append("Endocrine/reproductive toxicant flagged by authority list.")
+
+        jr = k.get("lists", {}).get(jurisdiction, {})
+        if jr.get("annex_xiv_authorisation"):
+            messages.append("Authorization required before use (Annex XIV).")
+        if jr.get("restriction_annex_xvii"):
+            messages.append("Restricted use conditions apply (Annex XVII).")
+        if jr.get("osha_specific_standard"):
+            messages.append("Subject to an OSHA substance‑specific standard (monitoring/medical surveillance may apply).")
+        if jr.get("prop65"):
+            messages.append("Listed under California Proposition 65 — warnings/notifications may apply.")
+        if jr.get("tsca_action"):
+            messages.append("Subject to TSCA rulemaking or action (check conditions).")
+        if jr.get("ghs_classification"):
+            messages.append(f"GHS classification in jurisdiction: {jr['ghs_classification']}.")
+        if jr.get("permit_required"):
+            messages.append(jr.get("permit_text", "Permit required in this jurisdiction."))
+            if jr.get("permit_url"):
+                links.append(jr["permit_url"])
+        links.extend(jr.get("urls", []))
+
+    if not messages:
+        return None
+    return Alert(level=level, substance=sub_name, cas=(cas or "—"), messages=messages, links=links)
+
+def render_alerts(detected_substances: List[Tuple[str, Optional[str]]], jurisdiction: str, docs: List[SDSDoc], pc_map: Dict[str, PubChemInfo]):
+    all_text = "\n".join(d.text for d in docs)
+    h_codes = extract_h_statements(all_text)
+
+    alerts: List[Alert] = []
+    for name, cas in detected_substances:
+        a = evaluate_substance(name, cas, jurisdiction, h_codes)
+        if a:
+            alerts.append(a)
+
+    if not alerts:
+        return
+
+    any_warning = any(a.level == "warning" for a in alerts)
+    header = "⚠️ Compliance Alerts — Action Recommended" if any_warning else "ℹ️ Compliance Notes"
+
+    box = st.warning if any_warning else st.info
+    with st.container():
+        box(header)
+        for a in alerts:
+            st.markdown(f"**{a.substance}** ({a.cas})")
+            for m in sorted(set(a.messages)):
+                st.markdown(f"- {m}")
+            if a.links:
+                st.markdown("  Links:")
+                for url in sorted(set(a.links)):
+                    st.markdown(f"  - [{url}]({url})")
+        st.caption("This tool supports safety reviews; always verify against the original SDS and official regulatory texts for your site and use case.")
+
+# ---------- UI ----------
 st.title("🧪 Zi Safe — SDS Safety Summarizer")
-st.caption("Generate a safety brief from your chemistry procedure by fetching SDS for reactants & products.")
+st.caption("Paste a procedure, fetch SDS, get a safety brief + compliance alerts.")
 
 with st.expander("How it works & disclaimer", expanded=False):
-    st.markdown(
-        """
-        This tool searches vendor sites for SDS PDFs, extracts relevant sections, and builds a consolidated safety brief.
-        SDS formats vary; always cross‑check with the original PDFs and your institution's safety rules. For critical work,
-        get an EHS professional review. By using this tool, you confirm you have rights to access the referenced SDS.
-        """
-    )
+    st.markdown("""This tool searches vendor sites for SDS PDFs, extracts relevant sections, and builds a consolidated safety brief.
+SDS formats vary; always cross‑check with the original PDFs and your institution's rules. For critical work, get an EHS review.
+By using this tool, you confirm you have rights to access the referenced SDS.""")
 
 state = AppState()
 
-col1, col2 = st.columns([2,1])
+col1, col2 = st.columns([2, 1])
 with col1:
-    state.procedure_text = st.text_area(
-        "Paste your procedure (free text)",
-        height=220,
-        placeholder="e.g., Warm the mixture, then add acetic anhydride; cool, filter, and dry..."
-    )
+    proc_text = st.text_area("Paste your procedure (free text)", height=220,
+                             placeholder="e.g., Warm, then add acetic anhydride; cool, filter, and dry...")
 with col2:
-    supplier_str = st.text_input(
-        "Restrict search to suppliers (comma‑separated domains)",
-        ", ".join(DEFAULT_SUPPLIERS)
-    )
+    supplier_str = st.text_input("Restrict search to suppliers (comma‑separated domains)",
+                                 ", ".join(DEFAULT_SUPPLIERS))
     state.suppliers = [s.strip() for s in supplier_str.split(",") if s.strip()]
-    state.use_pubchem_normalize = st.toggle(
-        "Normalize via PubChem",
-        value=True,
-        help="Canonical names, CID & GHS H‑codes"
-    )
+    state.use_pubchem_normalize = st.toggle("Normalize via PubChem", value=True,
+                                            help="Canonical names, CID & GHS H‑codes")
 
 with st.sidebar:
     st.subheader("Search Settings")
     state.max_results = st.number_input("Results per chemical", 5, 50, 12, step=1)
     state.max_chemicals = st.number_input("Max chemicals per run", 1, 100, 20, step=1)
     state.delay_s = st.slider("Delay between requests (s)", 0.0, 1.0, 0.3, 0.1)
+    st.subheader("Compliance")
+    state.compliance_enabled = st.toggle("Enable compliance alerts", value=True)
+    state.jurisdiction = st.selectbox("Jurisdiction", ["US (Federal)", "California (Prop 65)", "EU (REACH/CLP)", "South Africa (HCA/GHS)"], index=0)
 
-# Auto-detect chemicals from the procedure:
-detected = detect_chemicals(state.procedure_text) if state.procedure_text.strip() else []
-
-# >>> SEMICOLON UPDATE: Pre-fill with semicolons so commas in names are preserved
+detected = detect_chemicals(proc_text) if proc_text.strip() else []
 st.subheader("Chemicals (edit as needed)")
-chem_input = st.text_input(
-    "Reactants, products, solvents (semicolon‑separated)",
-    value="; ".join(detected),  # <-- join with semicolons
-    help="Use semicolons (;) between names so commas inside names are preserved."
-)
-
-# >>> SEMICOLON UPDATE: Parse user input by semicolons
+chem_input = st.text_input("Reactants, products, solvents (semicolon‑separated)",
+                           value="; ".join(detected),
+                           help="Use semicolons (;) between names so commas inside names are preserved.")
 chemical_list = [c.strip() for c in chem_input.split(";") if c.strip()]
 
-# Optional: PubChem normalization preview
-pc_map: Dict[str, PubChemInfo] = {}
-if chemical_list and state.use_pubchem_normalize:
-    with st.spinner("Querying PubChem for canonical names & GHS…"):
-        pc_map = normalize_via_pubchem(chemical_list)
-    with st.expander("PubChem normalization", expanded=False):
-        for orig in chemical_list:
-            info = pc_map.get(orig)
-            if not info:
-                continue
-            title = info.canonical_name or info.iupac_name or orig
-            cid = info.cid or "—"
-            ghs = ", ".join(info.ghs_hcodes) if info.ghs_hcodes else "—"
-            st.markdown(f"**{orig}** → *{title}* (CID: {cid}) • GHS: {ghs}")
+# --- Diagnostics & manual SDS input ---
+with st.expander("Debug & Manual SDS input", expanded=False):
+    st.write("Use this to test your SerpAPI key and paste SDS URLs directly if needed.")
+    st.markdown(f"- **SERPAPI_KEY detected?** {'✅' if SERPAPI_KEY else '❌'}")
+    test_query = st.text_input("Test query (for SerpAPI)", value="benzene SDS filetype:pdf site:sigmaaldrich.com")
+    if st.button("Run SerpAPI test"):
+        if not SERPAPI_KEY:
+            st.error("No SERPAPI_KEY loaded. Put it in .env (local) or Secrets (Streamlit Cloud).")
+        else:
+            try:
+                r = requests.get(
+                    "https://serpapi.com/search.json",
+                    params={"engine": "google", "q": test_query, "num": 5, "api_key": SERPAPI_KEY},
+                    headers={"User-Agent": "ZiSafe/diag"},
+                    timeout=20,
+                )
+                st.write("HTTP status:", r.status_code)
+                data = r.json() if r.headers.get("content-type", "").startswith("application/json") else {}
+                org = data.get("organic_results", [])
+                st.write(f"Found {len(org)} organic_results")
+                for i, it in enumerate(org[:5], 1):
+                    st.write(i, it.get("title"), it.get("link"))
+            except Exception as e:
+                st.exception(e)
 
-run = st.button("🔎 Fetch SDS & Summarize", type="primary", disabled=(len(chemical_list)==0))
+    st.markdown("---")
+    st.write("Paste one or more SDS PDF URLs (one per line). These will be used in addition to search results.")
+    manual_urls = st.text_area("SDS PDF URLs", height=100, placeholder="https://...pdf\nhttps://...pdf")
+
+run = st.button("🔎 Fetch SDS & Summarize", type="primary", disabled=(len(chemical_list) == 0))
 
 results_docs: List[SDSDoc] = []
 status_placeholder = st.empty()
@@ -622,6 +716,7 @@ if run:
         st.error("SERPAPI_KEY missing. On Streamlit Cloud, set it in Secrets. Locally, add it to .env.")
     else:
         with st.spinner("Searching SDS and building your safety brief…"):
+            # Search via SerpAPI
             for chem in chemical_list[: state.max_chemicals]:
                 status_placeholder.info(f"Searching SDS for **{chem}**…")
                 time.sleep(state.delay_s)
@@ -632,7 +727,7 @@ if run:
                     if not fpath:
                         continue
                     text = extract_pdf_text(fpath)
-                    if len(text) < 500 or ("hazard" not in text.lower() and "first aid" not in text.lower()):
+                    if len(text) < 500 and "hazard" not in text.lower() and "first aid" not in text.lower():
                         continue
                     supplier_guess = guess_supplier_from_url(link) or "unknown"
                     results_docs.append(SDSDoc(chemical=chem, supplier=supplier_guess, url=link, filepath=fpath, text=text))
@@ -640,11 +735,43 @@ if run:
                     break
                 if not chosen:
                     status_placeholder.warning(f"No SDS PDF found or downloadable for {chem}. Try adjusting the name or suppliers.")
+
+            # Manual URL handling (guarantees a report path)
+            extra_links = [u.strip() for u in (manual_urls or "").splitlines() if u.strip()]
+            for link in extra_links:
+                fpath = download_pdf(link)
+                if not fpath:
+                    st.warning(f"Manual URL not usable as PDF: {link}")
+                    continue
+                text = extract_pdf_text(fpath)
+                if len(text) < 200:
+                    st.warning(f"Manual SDS appears to have little/no text (maybe scanned): {link}")
+                supplier_guess = guess_supplier_from_url(link) or "manual"
+                results_docs.append(SDSDoc(chemical="(manual SDS)", supplier=supplier_guess, url=link, filepath=fpath, text=text))
+
             status_placeholder.empty()
 
-# Render summaries
+# Render compliance + summary
 if results_docs:
-    md_summary, agg = consolidate_summary(results_docs, state.procedure_text, pc_map)
+    # Build (name, cas) for alerts using PubChem & KBase name index
+    pc_map: Dict[str, PubChemInfo] = {}
+    if chemical_list and state.use_pubchem_normalize:
+        with st.spinner("Querying PubChem for canonical names & GHS…"):
+            pc_map = normalize_via_pubchem(chemical_list)
+
+    detected_substances: List[Tuple[str, Optional[str]]] = []
+    for chem in chemical_list:
+        info = pc_map.get(chem)
+        cas = best_cas_from_pubchem(info) if info else None
+        if not cas:
+            name_key = (info.canonical_name or chem).strip().lower() if info else chem.strip().lower()
+            cas = KBASE_NAME_INDEX.get(name_key)
+        detected_substances.append((chem, cas))
+
+    if state.compliance_enabled:
+        render_alerts(detected_substances, state.jurisdiction, results_docs, pc_map)
+
+    md_summary, _ = consolidate_summary(results_docs, proc_text, pc_map)
     st.subheader("Consolidated Safety Summary")
     st.markdown(md_summary)
 

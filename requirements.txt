@@ -1,3 +1,9 @@
+streamlit
+requests
+pdfminer.six
+python-dotenv
+rapidfuzz
+pydantic
 streamlit>=1.33
 requests>=2.31
 pdfminer.six>=20231228

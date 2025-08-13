@@ -1,0 +1,114 @@
+{
+  "71-43-2": {
+    "name": "Benzene",
+    "hazards": {
+      "carcinogen": "1A",
+      "mutagen": true,
+      "repro_toxicant": false,
+      "edc": false
+    },
+    "lists": {
+      "US (Federal)": {
+        "osha_specific_standard": true,
+        "sara_313": true,
+        "urls": [
+          "https://www.osha.gov/benzene",
+          "https://www.epa.gov/toxics-release-inventory-tri-program"
+        ]
+      },
+      "California (Prop 65)": {
+        "prop65": true,
+        "urls": [
+          "https://oehha.ca.gov/proposition-65"
+        ]
+      },
+      "EU (REACH/CLP)": {
+        "clp_carcinogen": "1A",
+        "restriction_annex_xvii": true,
+        "urls": [
+          "https://echa.europa.eu/substance-information/-/substanceinfo/100.028.878"
+        ]
+      },
+      "South Africa (HCA/GHS)": {
+        "ghs_classification": "Carc.1A",
+        "permit_required": true,
+        "permit_text": "Storage over 50 L may require a local authority flammable substance permit.",
+        "permit_url": "https://www.labour.gov.za/legislation/acts/occupational-health-and-safety-act",
+        "urls": [
+          "https://www.labour.gov.za/legislation/acts/occupational-health-and-safety-act"
+        ]
+      }
+    }
+  },
+  "117-81-7": {
+    "name": "DEHP",
+    "hazards": {
+      "carcinogen": "2",
+      "mutagen": false,
+      "repro_toxicant": true,
+      "edc": true
+    },
+    "lists": {
+      "US (Federal)": {
+        "tsca_action": true,
+        "urls": [
+          "https://www.epa.gov/assessing-and-managing-chemicals-under-tsca"
+        ]
+      },
+      "California (Prop 65)": {
+        "prop65": true,
+        "urls": [
+          "https://oehha.ca.gov/proposition-65"
+        ]
+      },
+      "EU (REACH/CLP)": {
+        "svhc": true,
+        "annex_xiv_authorisation": true,
+        "urls": [
+          "https://echa.europa.eu/candidate-list-table"
+        ]
+      },
+      "South Africa (HCA/GHS)": {
+        "ghs_classification": "Repr.1B",
+        "urls": [
+          "https://www.sabs.co.za/"
+        ]
+      }
+    }
+  },
+  "50-00-0": {
+    "name": "Formaldehyde",
+    "hazards": {
+      "carcinogen": "1B",
+      "mutagen": true,
+      "repro_toxicant": false,
+      "edc": false
+    },
+    "lists": {
+      "US (Federal)": {
+        "osha_specific_standard": true,
+        "urls": [
+          "https://www.osha.gov/formaldehyde"
+        ]
+      },
+      "California (Prop 65)": {
+        "prop65": true,
+        "urls": [
+          "https://oehha.ca.gov/proposition-65"
+        ]
+      },
+      "EU (REACH/CLP)": {
+        "clp_carcinogen": "1B",
+        "urls": [
+          "https://echa.europa.eu/"
+        ]
+      },
+      "South Africa (HCA/GHS)": {
+        "ghs_classification": "Carc.1B",
+        "urls": [
+          "https://www.labour.gov.za/"
+        ]
+      }
+    }
+  }
+}
