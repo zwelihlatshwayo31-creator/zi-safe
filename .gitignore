@@ -9,5 +9,5 @@ sds_cache/
 # OS/editor files
 *.DS_Store
 
-# You already removed this from tracking; keep it ignored
+# Nested repo we removed
 zi-safe/
