@@ -659,9 +659,112 @@ def render_alerts(detected_substances: List[Tuple[str, Optional[str]]], jurisdic
                     st.markdown(f"  - [{url}]({url})")
         st.caption("This tool supports safety reviews; always verify against the original SDS and official regulatory texts for your site and use case.")
 
+
+
+# ---------- Ore mineralogy prediction ----------
+REGION_MINERAL_PRIORS = {
+    "western australia": ["hematite", "magnetite", "goethite"],
+    "nevada": ["chalcopyrite", "bornite", "malachite"],
+    "arizona": ["chalcopyrite", "chalcocite", "malachite"],
+    "chile": ["chalcopyrite", "chalcocite", "covellite"],
+    "south africa": ["chromite", "pyrite", "arsenopyrite"],
+    "ontario": ["pentlandite", "pyrrhotite", "chalcopyrite"],
+}
+
+COLOR_TO_MINERALS = {
+    "red": ["hematite", "cuprite"],
+    "brown": ["goethite", "limonite"],
+    "black": ["magnetite", "pyrolusite"],
+    "green": ["malachite", "chlorite"],
+    "blue": ["azurite", "covellite"],
+    "yellow": ["jarosite", "chalcopyrite"],
+    "gold": ["pyrite", "chalcopyrite"],
+    "brass": ["chalcopyrite", "pyrite"],
+    "silver": ["galena", "arsenopyrite"],
+}
+
+REAGENT_PACKAGES = {
+    "oxide_iron": ["Collector: hydroxamate", "Depressant: starch", "pH modifier: NaOH", "Frother: MIBC"],
+    "sulfide_copper": ["Collector: xanthate (PAX/SIPX)", "Activator: CuSO4 (if needed)", "Frother: MIBC", "pH modifier: lime"],
+    "lead_zinc": ["Collector: dithiophosphate", "Depressant: zinc sulfate or cyanide substitute", "Frother: polyglycol", "pH modifier: lime"],
+    "nickel_sulfide": ["Collector: xanthate + dithiophosphate blend", "Dispersant: sodium silicate", "Frother: MIBC", "pH modifier: soda ash"],
+}
+
+def predict_mineralogy(location: str, photo_notes: str) -> List[Tuple[str, float]]:
+    scores: Dict[str, float] = {}
+    blob = f"{location} {photo_notes}".lower()
+
+    for region, minerals in REGION_MINERAL_PRIORS.items():
+        if region in blob:
+            for i, m in enumerate(minerals):
+                scores[m] = scores.get(m, 0.0) + (0.45 - 0.08 * i)
+
+    for color, minerals in COLOR_TO_MINERALS.items():
+        if color in blob:
+            for i, m in enumerate(minerals):
+                scores[m] = scores.get(m, 0.0) + (0.35 - 0.07 * i)
+
+    if "metallic" in blob:
+        for m in ["pyrite", "chalcopyrite", "galena"]:
+            scores[m] = scores.get(m, 0.0) + 0.2
+    if "earthy" in blob:
+        for m in ["goethite", "limonite"]:
+            scores[m] = scores.get(m, 0.0) + 0.15
+
+    if not scores:
+        scores = {"quartz": 0.25, "pyrite": 0.22, "hematite": 0.2}
+
+    ranked = sorted(scores.items(), key=lambda kv: kv[1], reverse=True)[:5]
+    top = ranked[0][1] if ranked else 1.0
+    return [(m, round((s / top) * 100, 1)) for m, s in ranked]
+
+def reagent_package_for(minerals: List[str]) -> Tuple[str, List[str]]:
+    mset = {m.lower() for m in minerals}
+    if mset & {"hematite", "magnetite", "goethite", "limonite"}:
+        return "oxide_iron", REAGENT_PACKAGES["oxide_iron"]
+    if mset & {"chalcopyrite", "chalcocite", "covellite", "bornite", "malachite", "azurite"}:
+        return "sulfide_copper", REAGENT_PACKAGES["sulfide_copper"]
+    if mset & {"galena", "sphalerite"}:
+        return "lead_zinc", REAGENT_PACKAGES["lead_zinc"]
+    if mset & {"pentlandite", "pyrrhotite"}:
+        return "nickel_sulfide", REAGENT_PACKAGES["nickel_sulfide"]
+    return "sulfide_copper", REAGENT_PACKAGES["sulfide_copper"]
+
 # ---------- UI ----------
-st.title("🧪 Zi Safe — SDS Safety Summarizer")
-st.caption("Build: 2025‑08‑13 • Autofill + AI formatter")
+st.title("🧪 Zi Safe — Mining Safety & Mineral Intelligence")
+st.caption("Build: 2026‑05‑14 • SDS summarizer + ore mineralogy assistant")
+app_mode = st.radio("Choose workflow", ["SDS Safety Summarizer", "Ore Mineralogy Predictor"], horizontal=True)
+
+if app_mode == "Ore Mineralogy Predictor":
+    st.subheader("⛏️ Ore Mineralogy Predictor")
+    st.write("Upload ore photos and add location/context notes. The app estimates likely mineralogy and suggests a flotation reagent package.")
+    loc = st.text_input("Ore location (mine/site/region)", placeholder="e.g., Pilbara, Western Australia")
+    photos = st.file_uploader("Ore photos", type=["png", "jpg", "jpeg"], accept_multiple_files=True)
+    notes = st.text_area("Photo observations", placeholder="e.g., dark black bands, metallic luster, some reddish weathering")
+
+    if photos:
+        cols = st.columns(min(3, len(photos)))
+        for i, ph in enumerate(photos[:3]):
+            cols[i].image(ph, caption=ph.name, use_container_width=True)
+
+    if st.button("Predict mineralogy", type="primary"):
+        photo_names = " ".join([p.name for p in photos or []])
+        model_input = f"{notes} {photo_names}"
+        preds = predict_mineralogy(loc, model_input)
+        minerals = [m for m, _ in preds[:3]]
+        pkg_name, reagents = reagent_package_for(minerals)
+
+        st.markdown("### Predicted mineralogy")
+        for m, conf in preds:
+            st.write(f"- **{m.title()}** — confidence index: {conf}%")
+
+        st.markdown(f"### Suggested reagent package: `{pkg_name}`")
+        for r in reagents:
+            st.write(f"- {r}")
+
+        st.info("Recommendation is screening-level only. Confirm with XRD/XRF/QEMSCAN assays and bench flotation tests before plant deployment.")
+
+    st.stop()
 
 with st.expander("How it works & disclaimer", expanded=False):
     st.markdown("""This tool searches vendor sites for SDS PDFs, extracts relevant sections, and builds a consolidated safety brief.
